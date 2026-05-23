@@ -23,48 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Literal, TypeAlias, cast
 
-from lsprotocol.types import (
-    TEXT_DOCUMENT_CODE_ACTION,
-    TEXT_DOCUMENT_DEFINITION,
-    TEXT_DOCUMENT_DID_CHANGE,
-    TEXT_DOCUMENT_DID_OPEN,
-    TEXT_DOCUMENT_DID_SAVE,
-    TEXT_DOCUMENT_DOCUMENT_SYMBOL,
-    TEXT_DOCUMENT_FORMATTING,
-    TEXT_DOCUMENT_HOVER,
-    TEXT_DOCUMENT_REFERENCES,
-    AnnotatedTextEdit,
-    CodeAction,
-    CodeActionKind,
-    CodeActionOptions,
-    CodeActionParams,
-    CodeDescription,
-    CreateFile,
-    DefinitionParams,
-    DeleteFile,
-    Diagnostic,
-    DiagnosticSeverity,
-    DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams,
-    DocumentFormattingParams,
-    DocumentSymbol,
-    DocumentSymbolParams,
-    Hover,
-    HoverParams,
-    Location,
-    MarkupContent,
-    MarkupKind,
-    OptionalVersionedTextDocumentIdentifier,
-    Position,
-    Range,
-    ReferenceParams,
-    RenameFile,
-    SymbolKind,
-    TextDocumentEdit,
-    TextEdit,
-    WorkspaceEdit,
-)
+import lsprotocol.types as lsp_types
 from pygls.server import LanguageServer
 from typing_extensions import Self, assert_never
 
@@ -153,7 +112,7 @@ class Command:
 
 class TextRanges:
     @staticmethod
-    def full_document(source: str) -> Range:
+    def full_document(source: str) -> lsp_types.Range:
         """Return an LSP range covering all text in a document.
 
         >>> TextRanges.full_document("one\\ntwo")
@@ -162,9 +121,9 @@ class TextRanges:
         0:0-1:0
         """
         lines = source.split("\n")
-        return Range(
-            start=Position(line=0, character=0),
-            end=Position(line=len(lines) - 1, character=len(lines[-1])),
+        return lsp_types.Range(
+            start=lsp_types.Position(line=0, character=0),
+            end=lsp_types.Position(line=len(lines) - 1, character=len(lines[-1])),
         )
 
 
@@ -190,19 +149,21 @@ class JsonOutput:
 
 @dataclass(frozen=True, kw_only=True)
 class DiagnosticAndCodeAction:
-    diagnostic: Diagnostic
-    code_action: CodeAction | None
+    diagnostic: lsp_types.Diagnostic
+    code_action: lsp_types.CodeAction | None
 
 
 class LocationParser:
     @classmethod
-    def parse_stdout(cls, stdout: str) -> Location | list[Location] | None:
+    def parse_stdout(
+        cls, stdout: str
+    ) -> lsp_types.Location | list[lsp_types.Location] | None:
         """Parse a location, a list of locations, or null.
 
         Fields are zero-based.
 
         >>> loc = LocationParser.parse_stdout('{"uri": "file:///a.py", "line": 1, "character": 2}')
-        >>> isinstance(loc, Location), loc.range.start.line, loc.range.start.character
+        >>> isinstance(loc, lsp_types.Location), loc.range.start.line, loc.range.start.character
         (True, 1, 2)
         """
         if not stdout.strip():
@@ -215,9 +176,9 @@ class LocationParser:
         return cls.parse_item(raw)
 
     @classmethod
-    def parse_item(cls, item: JsonValue) -> Location:
+    def parse_item(cls, item: JsonValue) -> lsp_types.Location:
         value = JsonOutput.object(item, context="location")
-        return Location(
+        return lsp_types.Location(
             uri=cls.parse_uri(value),
             range=cls.parse_range(value),
         )
@@ -234,7 +195,7 @@ class LocationParser:
         raise TypeError(msg)
 
     @staticmethod
-    def parse_range(value: dict[str, JsonValue]) -> Range:
+    def parse_range(value: dict[str, JsonValue]) -> lsp_types.Range:
         line = DiagnosticParser.as_int(value.get("line", 0), field="line")
         character = DiagnosticParser.as_int(
             value.get("character", 0),
@@ -247,15 +208,15 @@ class LocationParser:
             value.get("end_character", max(character + 1, 1)),
             field="end_character",
         )
-        return Range(
-            start=Position(line=line, character=character),
-            end=Position(line=end_line, character=end_character),
+        return lsp_types.Range(
+            start=lsp_types.Position(line=line, character=character),
+            end=lsp_types.Position(line=end_line, character=end_character),
         )
 
 
 class HoverParser:
     @classmethod
-    def parse_stdout(cls, stdout: str) -> Hover | None:
+    def parse_stdout(cls, stdout: str) -> lsp_types.Hover | None:
         """Parse hover output as Markdown text or JSON.
 
         >>> HoverParser.parse_stdout("hello").contents.value
@@ -268,10 +229,12 @@ class HoverParser:
         try:
             raw = JsonOutput.loads(stdout)
         except json.JSONDecodeError:
-            return cls.from_text(stdout.rstrip("\n"), kind=MarkupKind.Markdown)
+            return cls.from_text(
+                stdout.rstrip("\n"), kind=lsp_types.MarkupKind.Markdown
+            )
 
         if isinstance(raw, str):
-            return cls.from_text(raw, kind=MarkupKind.Markdown)
+            return cls.from_text(raw, kind=lsp_types.MarkupKind.Markdown)
         value = JsonOutput.object(raw, context="hover")
         contents = value.get("contents")
         if not isinstance(contents, str):
@@ -281,27 +244,28 @@ class HoverParser:
         hover_range = None
         if "line" in value or "character" in value:
             hover_range = LocationParser.parse_range(value)
-        return Hover(
-            contents=MarkupContent(kind=kind, value=contents), range=hover_range
+        return lsp_types.Hover(
+            contents=lsp_types.MarkupContent(kind=kind, value=contents),
+            range=hover_range,
         )
 
     @staticmethod
-    def from_text(value: str, *, kind: MarkupKind) -> Hover:
-        return Hover(contents=MarkupContent(kind=kind, value=value))
+    def from_text(value: str, *, kind: lsp_types.MarkupKind) -> lsp_types.Hover:
+        return lsp_types.Hover(contents=lsp_types.MarkupContent(kind=kind, value=value))
 
     @staticmethod
-    def parse_markup_kind(value: JsonValue) -> MarkupKind:
+    def parse_markup_kind(value: JsonValue) -> lsp_types.MarkupKind:
         if value == "plaintext":
-            return MarkupKind.PlainText
+            return lsp_types.MarkupKind.PlainText
         if value == "markdown":
-            return MarkupKind.Markdown
+            return lsp_types.MarkupKind.Markdown
         msg = "hover kind must be markdown or plaintext"
         raise ValueError(msg)
 
 
 class DocumentSymbolParser:
     @classmethod
-    def parse_stdout(cls, stdout: str) -> list[DocumentSymbol]:
+    def parse_stdout(cls, stdout: str) -> list[lsp_types.DocumentSymbol]:
         """Parse document symbols from JSON.
 
         >>> symbols = DocumentSymbolParser.parse_stdout(
@@ -318,7 +282,7 @@ class DocumentSymbolParser:
         ]
 
     @classmethod
-    def parse_item(cls, item: JsonValue) -> DocumentSymbol:
+    def parse_item(cls, item: JsonValue) -> lsp_types.DocumentSymbol:
         value = JsonOutput.object(item, context="symbol")
         name = value.get("name")
         if not isinstance(name, str) or not name:
@@ -340,7 +304,7 @@ class DocumentSymbolParser:
                 for child in JsonOutput.list(raw_children, context="symbol children")
             ]
 
-        return DocumentSymbol(
+        return lsp_types.DocumentSymbol(
             name=name,
             detail=detail,
             kind=cls.parse_kind(value.get("kind", "function")),
@@ -350,7 +314,7 @@ class DocumentSymbolParser:
         )
 
     @staticmethod
-    def parse_selection_range(value: dict[str, JsonValue]) -> Range:
+    def parse_selection_range(value: dict[str, JsonValue]) -> lsp_types.Range:
         line = DiagnosticParser.as_int(
             value.get("selection_line", value.get("line", 0)),
             field="selection_line",
@@ -367,46 +331,46 @@ class DocumentSymbolParser:
             value.get("selection_end_character", max(character + 1, 1)),
             field="selection_end_character",
         )
-        return Range(
-            start=Position(line=line, character=character),
-            end=Position(line=end_line, character=end_character),
+        return lsp_types.Range(
+            start=lsp_types.Position(line=line, character=character),
+            end=lsp_types.Position(line=end_line, character=end_character),
         )
 
     @staticmethod
-    def parse_kind(value: JsonValue) -> SymbolKind:
+    def parse_kind(value: JsonValue) -> lsp_types.SymbolKind:
         if isinstance(value, int):
-            return SymbolKind(value)
+            return lsp_types.SymbolKind(value)
         if not isinstance(value, str):
             msg = "symbol kind must be a string or integer"
             raise TypeError(msg)
         normalized = value.lower().replace("_", "")
         kinds = {
-            "file": SymbolKind.File,
-            "module": SymbolKind.Module,
-            "namespace": SymbolKind.Namespace,
-            "package": SymbolKind.Package,
-            "class": SymbolKind.Class,
-            "method": SymbolKind.Method,
-            "property": SymbolKind.Property,
-            "field": SymbolKind.Field,
-            "constructor": SymbolKind.Constructor,
-            "enum": SymbolKind.Enum,
-            "interface": SymbolKind.Interface,
-            "function": SymbolKind.Function,
-            "variable": SymbolKind.Variable,
-            "constant": SymbolKind.Constant,
-            "string": SymbolKind.String,
-            "number": SymbolKind.Number,
-            "boolean": SymbolKind.Boolean,
-            "array": SymbolKind.Array,
-            "object": SymbolKind.Object,
-            "key": SymbolKind.Key,
-            "null": SymbolKind.Null,
-            "enummember": SymbolKind.EnumMember,
-            "struct": SymbolKind.Struct,
-            "event": SymbolKind.Event,
-            "operator": SymbolKind.Operator,
-            "typeparameter": SymbolKind.TypeParameter,
+            "file": lsp_types.SymbolKind.File,
+            "module": lsp_types.SymbolKind.Module,
+            "namespace": lsp_types.SymbolKind.Namespace,
+            "package": lsp_types.SymbolKind.Package,
+            "class": lsp_types.SymbolKind.Class,
+            "method": lsp_types.SymbolKind.Method,
+            "property": lsp_types.SymbolKind.Property,
+            "field": lsp_types.SymbolKind.Field,
+            "constructor": lsp_types.SymbolKind.Constructor,
+            "enum": lsp_types.SymbolKind.Enum,
+            "interface": lsp_types.SymbolKind.Interface,
+            "function": lsp_types.SymbolKind.Function,
+            "variable": lsp_types.SymbolKind.Variable,
+            "constant": lsp_types.SymbolKind.Constant,
+            "string": lsp_types.SymbolKind.String,
+            "number": lsp_types.SymbolKind.Number,
+            "boolean": lsp_types.SymbolKind.Boolean,
+            "array": lsp_types.SymbolKind.Array,
+            "object": lsp_types.SymbolKind.Object,
+            "key": lsp_types.SymbolKind.Key,
+            "null": lsp_types.SymbolKind.Null,
+            "enummember": lsp_types.SymbolKind.EnumMember,
+            "struct": lsp_types.SymbolKind.Struct,
+            "event": lsp_types.SymbolKind.Event,
+            "operator": lsp_types.SymbolKind.Operator,
+            "typeparameter": lsp_types.SymbolKind.TypeParameter,
         }
         try:
             return kinds[normalized]
@@ -416,15 +380,15 @@ class DocumentSymbolParser:
 
 
 class ShellCheckJsonParser:
-    SEVERITY_MAPPING: ClassVar[dict[str, DiagnosticSeverity]] = {
-        "error": DiagnosticSeverity.Error,
-        "warning": DiagnosticSeverity.Warning,
-        "info": DiagnosticSeverity.Information,
-        "style": DiagnosticSeverity.Hint,
+    SEVERITY_MAPPING: ClassVar[dict[str, lsp_types.DiagnosticSeverity]] = {
+        "error": lsp_types.DiagnosticSeverity.Error,
+        "warning": lsp_types.DiagnosticSeverity.Warning,
+        "info": lsp_types.DiagnosticSeverity.Information,
+        "style": lsp_types.DiagnosticSeverity.Hint,
     }
 
     @classmethod
-    def parse_diagnostics(cls, stdout: str) -> list[Diagnostic]:
+    def parse_diagnostics(cls, stdout: str) -> list[lsp_types.Diagnostic]:
         """Parse diagnostics from ShellCheck json1 output.
 
         >>> diagnostics = ShellCheckJsonParser.parse_diagnostics(
@@ -444,7 +408,9 @@ class ShellCheckJsonParser:
         ]
 
     @classmethod
-    def parse_code_actions(cls, stdout: str, *, file_uri: str) -> list[CodeAction]:
+    def parse_code_actions(
+        cls, stdout: str, *, file_uri: str
+    ) -> list[lsp_types.CodeAction]:
         return [
             item.code_action
             for item in cls.parse_diagnostics_and_code_actions(
@@ -488,7 +454,7 @@ class ShellCheckJsonParser:
         )
 
     @classmethod
-    def parse_diagnostic(cls, value: dict[str, JsonValue]) -> Diagnostic:
+    def parse_diagnostic(cls, value: dict[str, JsonValue]) -> lsp_types.Diagnostic:
         line = DiagnosticParser.one_based_to_zero_based(
             DiagnosticParser.as_int(value.get("line"), field="line"),
             field="line",
@@ -510,15 +476,15 @@ class ShellCheckJsonParser:
             msg = "shellcheck message must be a non-empty string"
             raise TypeError(msg)
         code = DiagnosticParser.as_int(value.get("code"), field="code")
-        return Diagnostic(
-            range=Range(
-                start=Position(line=line, character=character),
-                end=Position(line=end_line, character=end_character),
+        return lsp_types.Diagnostic(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=character),
+                end=lsp_types.Position(line=end_line, character=end_character),
             ),
             message=message,
             severity=cls.parse_severity(value.get("level")),
             code=code,
-            code_description=CodeDescription(
+            code_description=lsp_types.CodeDescription(
                 href=f"https://www.shellcheck.net/wiki/SC{code}",
             ),
             source="shellcheck",
@@ -530,8 +496,8 @@ class ShellCheckJsonParser:
         value: dict[str, JsonValue],
         *,
         file_uri: str,
-        diagnostic: Diagnostic,
-    ) -> CodeAction | None:
+        diagnostic: lsp_types.Diagnostic,
+    ) -> lsp_types.CodeAction | None:
         fix = value.get("fix")
         if fix is None:
             return None
@@ -546,21 +512,27 @@ class ShellCheckJsonParser:
         if not replacements:
             return None
 
-        return CodeAction(
+        return lsp_types.CodeAction(
             title=diagnostic.message,
             diagnostics=[diagnostic],
-            kind=CodeActionKind.QuickFix,
+            kind=lsp_types.CodeActionKind.QuickFix,
             is_preferred=True,
-            edit=WorkspaceEdit(
+            edit=lsp_types.WorkspaceEdit(
                 document_changes=cast(
-                    list[TextDocumentEdit | CreateFile | RenameFile | DeleteFile],
+                    list[
+                        lsp_types.TextDocumentEdit
+                        | lsp_types.CreateFile
+                        | lsp_types.RenameFile
+                        | lsp_types.DeleteFile
+                    ],
                     [
-                        TextDocumentEdit(
-                            text_document=OptionalVersionedTextDocumentIdentifier(
+                        lsp_types.TextDocumentEdit(
+                            text_document=lsp_types.OptionalVersionedTextDocumentIdentifier(
                                 uri=file_uri,
                             ),
                             edits=cast(
-                                list[TextEdit | AnnotatedTextEdit], replacements
+                                list[lsp_types.TextEdit | lsp_types.AnnotatedTextEdit],
+                                replacements,
                             ),
                         ),
                     ],
@@ -569,7 +541,7 @@ class ShellCheckJsonParser:
         )
 
     @staticmethod
-    def parse_replacement(value: JsonValue) -> TextEdit:
+    def parse_replacement(value: JsonValue) -> lsp_types.TextEdit:
         replacement = JsonOutput.object(value, context="shellcheck replacement")
         line = DiagnosticParser.one_based_to_zero_based(
             DiagnosticParser.as_int(replacement.get("line"), field="line"),
@@ -591,16 +563,16 @@ class ShellCheckJsonParser:
         if not isinstance(replacement_text, str):
             msg = "shellcheck replacement text must be a string"
             raise TypeError(msg)
-        return TextEdit(
-            range=Range(
-                start=Position(line=line, character=character),
-                end=Position(line=end_line, character=end_character),
+        return lsp_types.TextEdit(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=character),
+                end=lsp_types.Position(line=end_line, character=end_character),
             ),
             new_text=replacement_text,
         )
 
     @classmethod
-    def parse_severity(cls, value: JsonValue) -> DiagnosticSeverity:
+    def parse_severity(cls, value: JsonValue) -> lsp_types.DiagnosticSeverity:
         if not isinstance(value, str):
             msg = "shellcheck level must be a string"
             raise TypeError(msg)
@@ -621,7 +593,7 @@ class DiagnosticParser:
     )
 
     @classmethod
-    def parse_stdout(cls, stdout: str) -> list[Diagnostic]:
+    def parse_stdout(cls, stdout: str) -> list[lsp_types.Diagnostic]:
         """Parse command stdout as JSON or GCC-style diagnostics.
 
         Custom JSON line and character fields are zero-based. Ruff JSON and
@@ -680,7 +652,7 @@ class DiagnosticParser:
         return [cls.parse_json_item(item) for item in raw]
 
     @classmethod
-    def parse_json_item(cls, item: object) -> Diagnostic:
+    def parse_json_item(cls, item: object) -> lsp_types.Diagnostic:
         if not isinstance(item, dict):
             msg = "each diagnostic must be a JSON object"
             raise TypeError(msg)
@@ -693,7 +665,7 @@ class DiagnosticParser:
         return cls.parse_custom_json_item(json_item)
 
     @classmethod
-    def parse_custom_json_item(cls, item: dict[str, JsonValue]) -> Diagnostic:
+    def parse_custom_json_item(cls, item: dict[str, JsonValue]) -> lsp_types.Diagnostic:
         line = cls.as_int(item.get("line", 0), field="line")
         character = cls.as_int(item.get("character", 0), field="character")
         end_line = cls.as_int(item.get("end_line", line), field="end_line")
@@ -717,10 +689,10 @@ class DiagnosticParser:
             raise TypeError(msg)
 
         severity = cls.parse_severity(item.get("severity", "error"))
-        return Diagnostic(
-            range=Range(
-                start=Position(line=line, character=character),
-                end=Position(line=end_line, character=end_character),
+        return lsp_types.Diagnostic(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=character),
+                end=lsp_types.Position(line=end_line, character=end_character),
             ),
             message=message,
             severity=severity,
@@ -729,7 +701,7 @@ class DiagnosticParser:
         )
 
     @classmethod
-    def parse_ruff_item(cls, item: dict[str, JsonValue]) -> Diagnostic:
+    def parse_ruff_item(cls, item: dict[str, JsonValue]) -> lsp_types.Diagnostic:
         location = item.get("location")
         end_location = item.get("end_location", location)
         if not isinstance(location, dict) or not isinstance(end_location, dict):
@@ -763,10 +735,10 @@ class DiagnosticParser:
             msg = "ruff diagnostic code must be a string or null"
             raise TypeError(msg)
 
-        return Diagnostic(
-            range=Range(
-                start=Position(line=line, character=character),
-                end=Position(line=end_line, character=end_character),
+        return lsp_types.Diagnostic(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=character),
+                end=lsp_types.Position(line=end_line, character=end_character),
             ),
             message=message,
             severity=cls.parse_severity(item.get("severity", "error")),
@@ -775,7 +747,9 @@ class DiagnosticParser:
         )
 
     @classmethod
-    def parse_markdownlint_json_item(cls, item: dict[str, JsonValue]) -> Diagnostic:
+    def parse_markdownlint_json_item(
+        cls, item: dict[str, JsonValue]
+    ) -> lsp_types.Diagnostic:
         line = cls.one_based_to_zero_based(
             cls.as_int(item.get("line"), field="line"),
             field="line",
@@ -793,20 +767,20 @@ class DiagnosticParser:
             msg = "markdownlint description must be a string"
             raise TypeError(msg)
 
-        return Diagnostic(
-            range=Range(
-                start=Position(line=line, character=0),
-                end=Position(line=line, character=1),
+        return lsp_types.Diagnostic(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=0),
+                end=lsp_types.Position(line=line, character=1),
             ),
             message=description,
-            severity=DiagnosticSeverity.Warning,
+            severity=lsp_types.DiagnosticSeverity.Warning,
             source=filename,
             code=rule,
         )
 
     @classmethod
-    def parse_gcc_lines(cls, stdout: str) -> list[Diagnostic]:
-        diagnostics: list[Diagnostic] = []
+    def parse_gcc_lines(cls, stdout: str) -> list[lsp_types.Diagnostic]:
+        diagnostics: list[lsp_types.Diagnostic] = []
         for line in stdout.splitlines():
             if not line.strip():
                 continue
@@ -822,7 +796,7 @@ class DiagnosticParser:
         return diagnostics
 
     @classmethod
-    def parse_gcc_match(cls, match: re.Match[str]) -> Diagnostic:
+    def parse_gcc_match(cls, match: re.Match[str]) -> lsp_types.Diagnostic:
         line = cls.one_based_to_zero_based(
             cls.as_int(match.group("line"), field="line"),
             field="line",
@@ -837,10 +811,10 @@ class DiagnosticParser:
         if code_match is not None:
             message = message[: code_match.start()].rstrip()
 
-        return Diagnostic(
-            range=Range(
-                start=Position(line=line, character=character),
-                end=Position(line=line, character=character + 1),
+        return lsp_types.Diagnostic(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=character),
+                end=lsp_types.Position(line=line, character=character + 1),
             ),
             message=message,
             severity=cls.parse_gcc_severity(match.group("severity")),
@@ -849,7 +823,7 @@ class DiagnosticParser:
         )
 
     @classmethod
-    def parse_markdownlint_match(cls, match: re.Match[str]) -> Diagnostic:
+    def parse_markdownlint_match(cls, match: re.Match[str]) -> lsp_types.Diagnostic:
         line = cls.one_based_to_zero_based(
             cls.as_int(match.group("line"), field="line"),
             field="line",
@@ -863,13 +837,13 @@ class DiagnosticParser:
             )
         code = match.group("code").split("/", maxsplit=1)[0]
 
-        return Diagnostic(
-            range=Range(
-                start=Position(line=line, character=character),
-                end=Position(line=line, character=character + 1),
+        return lsp_types.Diagnostic(
+            range=lsp_types.Range(
+                start=lsp_types.Position(line=line, character=character),
+                end=lsp_types.Position(line=line, character=character + 1),
             ),
             message=match.group("message"),
-            severity=DiagnosticSeverity.Warning,
+            severity=lsp_types.DiagnosticSeverity.Warning,
             source=match.group("path"),
             code=code,
         )
@@ -894,17 +868,17 @@ class DiagnosticParser:
         return value - 1
 
     @classmethod
-    def parse_gcc_severity(cls, value: str | None) -> DiagnosticSeverity:
+    def parse_gcc_severity(cls, value: str | None) -> lsp_types.DiagnosticSeverity:
         if value == "note":
-            return DiagnosticSeverity.Information
+            return lsp_types.DiagnosticSeverity.Information
         if value == "info":
-            return DiagnosticSeverity.Information
+            return lsp_types.DiagnosticSeverity.Information
         if value is None:
-            return DiagnosticSeverity.Error
+            return lsp_types.DiagnosticSeverity.Error
         return cls.parse_severity(value)
 
     @staticmethod
-    def parse_severity(value: object) -> DiagnosticSeverity:
+    def parse_severity(value: object) -> lsp_types.DiagnosticSeverity:
         """Parse LSP diagnostic severities.
 
         >>> DiagnosticParser.parse_severity("error")
@@ -913,7 +887,7 @@ class DiagnosticParser:
         <DiagnosticSeverity.Warning: 2>
         """
         if isinstance(value, int):
-            return DiagnosticSeverity(value)
+            return lsp_types.DiagnosticSeverity(value)
         if not isinstance(value, str):
             msg = "diagnostic severity must be a string or integer"
             raise TypeError(msg)
@@ -921,13 +895,13 @@ class DiagnosticParser:
         severity = cast(SeverityName, value.lower())
         match severity:
             case "error":
-                return DiagnosticSeverity.Error
+                return lsp_types.DiagnosticSeverity.Error
             case "warning":
-                return DiagnosticSeverity.Warning
+                return lsp_types.DiagnosticSeverity.Warning
             case "information":
-                return DiagnosticSeverity.Information
+                return lsp_types.DiagnosticSeverity.Information
             case "hint":
-                return DiagnosticSeverity.Hint
+                return lsp_types.DiagnosticSeverity.Hint
             case _:
                 assert_never(severity)
 
@@ -987,12 +961,12 @@ class ServerConfig:
     def register_formatting(self, server: LanguageServer) -> None:
         command = self.require_format_command()
 
-        @server.feature(TEXT_DOCUMENT_FORMATTING)
+        @server.feature(lsp_types.TEXT_DOCUMENT_FORMATTING)
         def formatting(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: DocumentFormattingParams,
-        ) -> list[TextEdit]:
-            logging.debug("%s %s", TEXT_DOCUMENT_FORMATTING, params)
+            params: lsp_types.DocumentFormattingParams,
+        ) -> list[lsp_types.TextEdit]:
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_FORMATTING, params)
             doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
                 result = command.run(
@@ -1024,52 +998,54 @@ class ServerConfig:
                 return []
 
             return [
-                TextEdit(
+                lsp_types.TextEdit(
                     range=TextRanges.full_document(doc.source),
                     new_text=result.stdout,
                 ),
             ]
 
     def register_diagnostics(self, server: LanguageServer) -> None:
-        @server.feature(TEXT_DOCUMENT_DID_OPEN)
+        @server.feature(lsp_types.TEXT_DOCUMENT_DID_OPEN)
         def did_open(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: DidOpenTextDocumentParams,
+            params: lsp_types.DidOpenTextDocumentParams,
         ) -> None:
-            logging.debug("%s %s", TEXT_DOCUMENT_DID_OPEN, params)
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DID_OPEN, params)
             self.publish_diagnostics(ls, params.text_document.uri)
 
-        @server.feature(TEXT_DOCUMENT_DID_SAVE)
+        @server.feature(lsp_types.TEXT_DOCUMENT_DID_SAVE)
         def did_save(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: DidSaveTextDocumentParams,
+            params: lsp_types.DidSaveTextDocumentParams,
         ) -> None:
-            logging.debug("%s %s", TEXT_DOCUMENT_DID_SAVE, params)
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DID_SAVE, params)
             self.publish_diagnostics(ls, params.text_document.uri)
 
         if not self.diagnostics_on_change:
             return
 
-        @server.feature(TEXT_DOCUMENT_DID_CHANGE)
+        @server.feature(lsp_types.TEXT_DOCUMENT_DID_CHANGE)
         def did_change(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: DidChangeTextDocumentParams,
+            params: lsp_types.DidChangeTextDocumentParams,
         ) -> None:
-            logging.debug("%s %s", TEXT_DOCUMENT_DID_CHANGE, params)
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DID_CHANGE, params)
             self.publish_diagnostics(ls, params.text_document.uri)
 
     def register_code_actions(self, server: LanguageServer) -> None:
         command = self.require_code_actions_command()
 
         @server.feature(
-            TEXT_DOCUMENT_CODE_ACTION,
-            CodeActionOptions(code_action_kinds=[CodeActionKind.QuickFix]),
+            lsp_types.TEXT_DOCUMENT_CODE_ACTION,
+            lsp_types.CodeActionOptions(
+                code_action_kinds=[lsp_types.CodeActionKind.QuickFix]
+            ),
         )
         def code_actions(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: CodeActionParams,
-        ) -> list[CodeAction]:
-            logging.debug("%s %s", TEXT_DOCUMENT_CODE_ACTION, params)
+            params: lsp_types.CodeActionParams,
+        ) -> list[lsp_types.CodeAction]:
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_CODE_ACTION, params)
             doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
                 result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
@@ -1103,12 +1079,12 @@ class ServerConfig:
     def register_hover(self, server: LanguageServer) -> None:
         command = self.require_hover_command()
 
-        @server.feature(TEXT_DOCUMENT_HOVER)
+        @server.feature(lsp_types.TEXT_DOCUMENT_HOVER)
         def hover(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: HoverParams,
-        ) -> Hover | None:
-            logging.debug("%s %s", TEXT_DOCUMENT_HOVER, params)
+            params: lsp_types.HoverParams,
+        ) -> lsp_types.Hover | None:
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_HOVER, params)
             doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
                 result = command.run(
@@ -1145,12 +1121,12 @@ class ServerConfig:
     def register_definition(self, server: LanguageServer) -> None:
         command = self.require_definition_command()
 
-        @server.feature(TEXT_DOCUMENT_DEFINITION)
+        @server.feature(lsp_types.TEXT_DOCUMENT_DEFINITION)
         def definition(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: DefinitionParams,
-        ) -> Location | list[Location] | None:
-            logging.debug("%s %s", TEXT_DOCUMENT_DEFINITION, params)
+            params: lsp_types.DefinitionParams,
+        ) -> lsp_types.Location | list[lsp_types.Location] | None:
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DEFINITION, params)
             return self.run_location_command(
                 ls,
                 command=command,
@@ -1163,12 +1139,12 @@ class ServerConfig:
     def register_references(self, server: LanguageServer) -> None:
         command = self.require_references_command()
 
-        @server.feature(TEXT_DOCUMENT_REFERENCES)
+        @server.feature(lsp_types.TEXT_DOCUMENT_REFERENCES)
         def references(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: ReferenceParams,
-        ) -> list[Location] | None:
-            logging.debug("%s %s", TEXT_DOCUMENT_REFERENCES, params)
+            params: lsp_types.ReferenceParams,
+        ) -> list[lsp_types.Location] | None:
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_REFERENCES, params)
             locations = self.run_location_command(
                 ls,
                 command=command,
@@ -1177,19 +1153,19 @@ class ServerConfig:
                 character=params.position.character,
                 title="references error",
             )
-            if isinstance(locations, Location):
+            if isinstance(locations, lsp_types.Location):
                 return [locations]
             return locations
 
     def register_document_symbols(self, server: LanguageServer) -> None:
         command = self.require_document_symbols_command()
 
-        @server.feature(TEXT_DOCUMENT_DOCUMENT_SYMBOL)
+        @server.feature(lsp_types.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
         def document_symbols(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
-            params: DocumentSymbolParams,
-        ) -> list[DocumentSymbol]:
-            logging.debug("%s %s", TEXT_DOCUMENT_DOCUMENT_SYMBOL, params)
+            params: lsp_types.DocumentSymbolParams,
+        ) -> list[lsp_types.DocumentSymbol]:
+            logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DOCUMENT_SYMBOL, params)
             doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
                 result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
@@ -1226,7 +1202,7 @@ class ServerConfig:
         line: int,
         character: int,
         title: str,
-    ) -> Location | list[Location] | None:
+    ) -> lsp_types.Location | list[lsp_types.Location] | None:
         doc = ls.workspace.get_text_document(uri)
         try:
             result = command.run(
