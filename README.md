@@ -4,6 +4,7 @@ The server exposes external commands through practical LSP features:
 
 - document formatting
 - diagnostics
+- quick-fix code actions
 - hover
 - go to definition
 - find references
@@ -26,7 +27,8 @@ Examples:
 ```sh
 ./simple_lsp_server.py \
   --format-command 'shfmt -filename {file_path} -' \
-  --diagnostics-command 'shellcheck --format=gcc -s sh -'
+  --diagnostics-command 'shellcheck - --exclude=SC1091,SC2312 --enable=all --format=json1' \
+  --code-actions-command 'shellcheck - --exclude=SC1091,SC2312 --enable=all --format=json1'
 ```
 
 ```sh
@@ -51,9 +53,13 @@ Supported diagnostic output formats:
 
 - Ruff JSON from `ruff check --output-format json`
 - Markdownlint JSON from `mdl --json`
+- ShellCheck JSON from `shellcheck --format=json1`
 - GCC-style lines such as `path:line:column: warning: message [CODE]`
 - Custom JSON lists with zero-based `line`, `character`, `message`, and
   optional `end_line`, `end_character`, `severity`, `source`, and `code`
+
+Quick-fix code actions currently support ShellCheck JSON from
+`shellcheck --format=json1`.
 
 Hover output can be plain Markdown text or JSON:
 

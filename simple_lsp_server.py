@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import ClassVar, Literal, TypeAlias, cast
 
 from lsprotocol.types import (
+    TEXT_DOCUMENT_CODE_ACTION,
     TEXT_DOCUMENT_DEFINITION,
     TEXT_DOCUMENT_DID_CHANGE,
     TEXT_DOCUMENT_DID_OPEN,
@@ -32,7 +33,15 @@ from lsprotocol.types import (
     TEXT_DOCUMENT_FORMATTING,
     TEXT_DOCUMENT_HOVER,
     TEXT_DOCUMENT_REFERENCES,
+    AnnotatedTextEdit,
+    CodeAction,
+    CodeActionKind,
+    CodeActionOptions,
+    CodeActionParams,
+    CodeDescription,
+    CreateFile,
     DefinitionParams,
+    DeleteFile,
     Diagnostic,
     DiagnosticSeverity,
     DidChangeTextDocumentParams,
@@ -46,11 +55,15 @@ from lsprotocol.types import (
     Location,
     MarkupContent,
     MarkupKind,
+    OptionalVersionedTextDocumentIdentifier,
     Position,
     Range,
     ReferenceParams,
+    RenameFile,
     SymbolKind,
+    TextDocumentEdit,
     TextEdit,
+    WorkspaceEdit,
 )
 from pygls.server import LanguageServer
 from typing_extensions import Self, assert_never
@@ -173,6 +186,12 @@ class JsonOutput:
             msg = f"{context} must be a JSON list"
             raise TypeError(msg)
         return value
+
+
+@dataclass(frozen=True, kw_only=True)
+class DiagnosticAndCodeAction:
+    diagnostic: Diagnostic
+    code_action: CodeAction | None
 
 
 class LocationParser:
@@ -396,6 +415,202 @@ class DocumentSymbolParser:
             raise ValueError(msg) from error
 
 
+class ShellCheckJsonParser:
+    SEVERITY_MAPPING: ClassVar[dict[str, DiagnosticSeverity]] = {
+        "error": DiagnosticSeverity.Error,
+        "warning": DiagnosticSeverity.Warning,
+        "info": DiagnosticSeverity.Information,
+        "style": DiagnosticSeverity.Hint,
+    }
+
+    @classmethod
+    def parse_diagnostics(cls, stdout: str) -> list[Diagnostic]:
+        """Parse diagnostics from ShellCheck json1 output.
+
+        >>> diagnostics = ShellCheckJsonParser.parse_diagnostics(
+        ...     '{"comments": [{"line": 1, "endLine": 1, "column": 6,'
+        ...     ' "endColumn": 8, "level": "warning", "code": 2154,'
+        ...     ' "message": "x is referenced but not assigned."}]}'
+        ... )
+        >>> [(d.range.start.line, d.range.start.character, d.code, d.severity) for d in diagnostics]
+        [(0, 5, 2154, <DiagnosticSeverity.Warning: 2>)]
+        """
+        return [
+            item.diagnostic
+            for item in cls.parse_diagnostics_and_code_actions(
+                stdout,
+                file_uri="file:///unknown",
+            )
+        ]
+
+    @classmethod
+    def parse_code_actions(cls, stdout: str, *, file_uri: str) -> list[CodeAction]:
+        return [
+            item.code_action
+            for item in cls.parse_diagnostics_and_code_actions(
+                stdout,
+                file_uri=file_uri,
+            )
+            if item.code_action is not None
+        ]
+
+    @classmethod
+    def parse_diagnostics_and_code_actions(
+        cls,
+        stdout: str,
+        *,
+        file_uri: str,
+    ) -> list[DiagnosticAndCodeAction]:
+        if not stdout.strip():
+            return []
+        raw = JsonOutput.object(JsonOutput.loads(stdout), context="shellcheck output")
+        comments = JsonOutput.list(
+            raw.get("comments", []), context="shellcheck comments"
+        )
+        return [cls.parse_comment(comment, file_uri=file_uri) for comment in comments]
+
+    @classmethod
+    def parse_comment(
+        cls,
+        comment: JsonValue,
+        *,
+        file_uri: str,
+    ) -> DiagnosticAndCodeAction:
+        value = JsonOutput.object(comment, context="shellcheck comment")
+        diagnostic = cls.parse_diagnostic(value)
+        return DiagnosticAndCodeAction(
+            diagnostic=diagnostic,
+            code_action=cls.parse_code_action(
+                value,
+                file_uri=file_uri,
+                diagnostic=diagnostic,
+            ),
+        )
+
+    @classmethod
+    def parse_diagnostic(cls, value: dict[str, JsonValue]) -> Diagnostic:
+        line = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(value.get("line"), field="line"),
+            field="line",
+        )
+        character = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(value.get("column"), field="column"),
+            field="column",
+        )
+        end_line = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(value.get("endLine"), field="endLine"),
+            field="endLine",
+        )
+        end_character = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(value.get("endColumn"), field="endColumn"),
+            field="endColumn",
+        )
+        message = value.get("message")
+        if not isinstance(message, str) or not message:
+            msg = "shellcheck message must be a non-empty string"
+            raise TypeError(msg)
+        code = DiagnosticParser.as_int(value.get("code"), field="code")
+        return Diagnostic(
+            range=Range(
+                start=Position(line=line, character=character),
+                end=Position(line=end_line, character=end_character),
+            ),
+            message=message,
+            severity=cls.parse_severity(value.get("level")),
+            code=code,
+            code_description=CodeDescription(
+                href=f"https://www.shellcheck.net/wiki/SC{code}",
+            ),
+            source="shellcheck",
+        )
+
+    @classmethod
+    def parse_code_action(
+        cls,
+        value: dict[str, JsonValue],
+        *,
+        file_uri: str,
+        diagnostic: Diagnostic,
+    ) -> CodeAction | None:
+        fix = value.get("fix")
+        if fix is None:
+            return None
+        fix_object = JsonOutput.object(fix, context="shellcheck fix")
+        replacements = [
+            cls.parse_replacement(replacement)
+            for replacement in JsonOutput.list(
+                fix_object.get("replacements", []),
+                context="shellcheck replacements",
+            )
+        ]
+        if not replacements:
+            return None
+
+        return CodeAction(
+            title=diagnostic.message,
+            diagnostics=[diagnostic],
+            kind=CodeActionKind.QuickFix,
+            is_preferred=True,
+            edit=WorkspaceEdit(
+                document_changes=cast(
+                    list[TextDocumentEdit | CreateFile | RenameFile | DeleteFile],
+                    [
+                        TextDocumentEdit(
+                            text_document=OptionalVersionedTextDocumentIdentifier(
+                                uri=file_uri,
+                            ),
+                            edits=cast(
+                                list[TextEdit | AnnotatedTextEdit], replacements
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+        )
+
+    @staticmethod
+    def parse_replacement(value: JsonValue) -> TextEdit:
+        replacement = JsonOutput.object(value, context="shellcheck replacement")
+        line = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(replacement.get("line"), field="line"),
+            field="line",
+        )
+        character = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(replacement.get("column"), field="column"),
+            field="column",
+        )
+        end_line = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(replacement.get("endLine"), field="endLine"),
+            field="endLine",
+        )
+        end_character = DiagnosticParser.one_based_to_zero_based(
+            DiagnosticParser.as_int(replacement.get("endColumn"), field="endColumn"),
+            field="endColumn",
+        )
+        replacement_text = replacement.get("replacement")
+        if not isinstance(replacement_text, str):
+            msg = "shellcheck replacement text must be a string"
+            raise TypeError(msg)
+        return TextEdit(
+            range=Range(
+                start=Position(line=line, character=character),
+                end=Position(line=end_line, character=end_character),
+            ),
+            new_text=replacement_text,
+        )
+
+    @classmethod
+    def parse_severity(cls, value: JsonValue) -> DiagnosticSeverity:
+        if not isinstance(value, str):
+            msg = "shellcheck level must be a string"
+            raise TypeError(msg)
+        try:
+            return cls.SEVERITY_MAPPING[value]
+        except KeyError as error:
+            msg = f"unsupported shellcheck level: {value}"
+            raise ValueError(msg) from error
+
+
 class DiagnosticParser:
     DEFAULT_SOURCE: ClassVar[str] = "simple-lsp-server"
     GCC_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
@@ -436,6 +651,13 @@ class DiagnosticParser:
         ... )
         >>> [(d.range.start.line, d.range.start.character, d.message, d.code) for d in mdl_json]
         [(1, 0, 'First line', 'MD041')]
+        >>> shellcheck = DiagnosticParser.parse_stdout(
+        ...     '{"comments": [{"line": 1, "endLine": 1, "column": 6,'
+        ...     ' "endColumn": 8, "level": "warning", "code": 2154,'
+        ...     ' "message": "x is referenced but not assigned."}]}'
+        ... )
+        >>> [(d.range.start.line, d.range.start.character, d.code) for d in shellcheck]
+        [(0, 5, 2154)]
         >>> DiagnosticParser.parse_stdout("")
         []
         """
@@ -448,6 +670,8 @@ class DiagnosticParser:
             return cls.parse_gcc_lines(stdout)
 
         if isinstance(raw, dict):
+            if "comments" in raw:
+                return ShellCheckJsonParser.parse_diagnostics(stdout)
             raw = raw.get("diagnostics", [])
         if not isinstance(raw, list):
             msg = "diagnostics output must be a JSON list or object with a diagnostics list"
@@ -712,6 +936,7 @@ class DiagnosticParser:
 class ServerConfig:
     format_command: Command | None
     diagnostics_command: Command | None
+    code_actions_command: Command | None
     hover_command: Command | None
     definition_command: Command | None
     references_command: Command | None
@@ -722,6 +947,7 @@ class ServerConfig:
         commands = (
             self.format_command,
             self.diagnostics_command,
+            self.code_actions_command,
             self.hover_command,
             self.definition_command,
             self.references_command,
@@ -740,6 +966,9 @@ class ServerConfig:
 
         if self.diagnostics_command is not None:
             self.register_diagnostics(server)
+
+        if self.code_actions_command is not None:
+            self.register_code_actions(server)
 
         if self.hover_command is not None:
             self.register_hover(server)
@@ -828,6 +1057,48 @@ class ServerConfig:
         ) -> None:
             logging.debug("%s %s", TEXT_DOCUMENT_DID_CHANGE, params)
             self.publish_diagnostics(ls, params.text_document.uri)
+
+    def register_code_actions(self, server: LanguageServer) -> None:
+        command = self.require_code_actions_command()
+
+        @server.feature(
+            TEXT_DOCUMENT_CODE_ACTION,
+            CodeActionOptions(code_action_kinds=[CodeActionKind.QuickFix]),
+        )
+        def code_actions(  # pyright: ignore[reportUnusedFunction]
+            ls: LanguageServer,
+            params: CodeActionParams,
+        ) -> list[CodeAction]:
+            logging.debug("%s %s", TEXT_DOCUMENT_CODE_ACTION, params)
+            doc = ls.workspace.get_text_document(params.text_document.uri)
+            try:
+                result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
+                if result.returncode != 0 and not result.stdout.strip():
+                    raise subprocess.CalledProcessError(
+                        result.returncode,
+                        result.argv,
+                        output=result.stdout,
+                        stderr=result.stderr,
+                    )
+                return ShellCheckJsonParser.parse_code_actions(
+                    result.stdout,
+                    file_uri=doc.uri,
+                )
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                self.log_command_error(
+                    ls,
+                    title="code actions error",
+                    command=command,
+                    file_path=doc.path,
+                    error=error,
+                )
+                return []
 
     def register_hover(self, server: LanguageServer) -> None:
         command = self.require_hover_command()
@@ -1034,6 +1305,12 @@ class ServerConfig:
             raise ValueError(msg)
         return self.diagnostics_command
 
+    def require_code_actions_command(self) -> Command:
+        if self.code_actions_command is None:
+            msg = "code actions command is not configured"
+            raise ValueError(msg)
+        return self.code_actions_command
+
     def require_hover_command(self) -> Command:
         if self.hover_command is None:
             msg = "hover command is not configured"
@@ -1081,6 +1358,7 @@ class ServerConfig:
 class Args:
     format_command: str | None
     diagnostics_command: str | None
+    code_actions_command: str | None
     hover_command: str | None
     definition_command: str | None
     references_command: str | None
@@ -1105,6 +1383,13 @@ class Args:
             help=(
                 "diagnostics command. It receives the document on stdin and should write "
                 "JSON diagnostics to stdout. Supports {file_path} and {uri}."
+            ),
+        )
+        _ = parser.add_argument(
+            "--code-actions-command",
+            help=(
+                "code actions command. It receives the document on stdin and should "
+                "write ShellCheck json1 output to stdout. Supports {file_path} and {uri}."
             ),
         )
         _ = parser.add_argument(
@@ -1152,6 +1437,7 @@ class Args:
         return cls(
             format_command=cast(str | None, args.format_command),
             diagnostics_command=cast(str | None, args.diagnostics_command),
+            code_actions_command=cast(str | None, args.code_actions_command),
             hover_command=cast(str | None, args.hover_command),
             definition_command=cast(str | None, args.definition_command),
             references_command=cast(str | None, args.references_command),
@@ -1164,6 +1450,7 @@ class Args:
         return ServerConfig(
             format_command=self.to_command(self.format_command),
             diagnostics_command=self.to_command(self.diagnostics_command),
+            code_actions_command=self.to_command(self.code_actions_command),
             hover_command=self.to_command(self.hover_command),
             definition_command=self.to_command(self.definition_command),
             references_command=self.to_command(self.references_command),
