@@ -32,6 +32,9 @@ SeverityName = Literal["error", "warning", "information", "hint"]
 JsonValue: TypeAlias = (
     None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 )
+CommandException: TypeAlias = (
+    OSError | subprocess.SubprocessError | json.JSONDecodeError | TypeError | ValueError
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -40,6 +43,24 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class CommandDocument:
+    source: str
+    path: str
+    uri: str
+
+    @classmethod
+    def from_server(cls, ls: LanguageServer, uri: str) -> Self:
+        doc = ls.workspace.get_text_document(uri)
+        return cls(source=doc.source, path=doc.path, uri=doc.uri)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CommandRun:
+    document: CommandDocument
+    result: CommandResult
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -177,6 +198,23 @@ class TextRanges:
 
 class LspRanges:
     @staticmethod
+    def create(
+        *,
+        line: int,
+        character: int,
+        end_line: int | None = None,
+        end_character: int | None = None,
+    ) -> lsp_types.Range:
+        if end_line is None:
+            end_line = line
+        if end_character is None:
+            end_character = max(character + 1, 1)
+        return lsp_types.Range(
+            start=lsp_types.Position(line=line, character=character),
+            end=lsp_types.Position(line=end_line, character=end_character),
+        )
+
+    @staticmethod
     def overlaps(left: lsp_types.Range, right: lsp_types.Range) -> bool:
         """Return whether two LSP ranges overlap or touch.
 
@@ -222,6 +260,26 @@ class JsonOutput:
             msg = f"{context} must be a JSON list"
             raise TypeError(msg)
         return value
+
+    @staticmethod
+    def int(value: object, *, field: str) -> int:
+        if isinstance(value, str):
+            value = int(value)
+        if not isinstance(value, int):
+            msg = f"{field} must be an integer"
+            raise TypeError(msg)
+        if value < 0:
+            msg = f"{field} must be non-negative"
+            raise ValueError(msg)
+        return value
+
+    @classmethod
+    def one_based_int(cls, value: object, *, field: str) -> int:
+        parsed = cls.int(value, field=field)
+        if parsed == 0:
+            msg = f"{field} must be one-based"
+            raise ValueError(msg)
+        return parsed - 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -322,21 +380,21 @@ class LocationParser:
 
     @staticmethod
     def parse_range(value: dict[str, JsonValue]) -> lsp_types.Range:
-        line = DiagnosticParser.as_int(value.get("line", 0), field="line")
-        character = DiagnosticParser.as_int(
+        line = JsonOutput.int(value.get("line", 0), field="line")
+        character = JsonOutput.int(
             value.get("character", 0),
             field="character",
         )
-        end_line = DiagnosticParser.as_int(
-            value.get("end_line", line), field="end_line"
-        )
-        end_character = DiagnosticParser.as_int(
+        end_line = JsonOutput.int(value.get("end_line", line), field="end_line")
+        end_character = JsonOutput.int(
             value.get("end_character", max(character + 1, 1)),
             field="end_character",
         )
-        return lsp_types.Range(
-            start=lsp_types.Position(line=line, character=character),
-            end=lsp_types.Position(line=end_line, character=end_character),
+        return LspRanges.create(
+            line=line,
+            character=character,
+            end_line=end_line,
+            end_character=end_character,
         )
 
 
@@ -441,25 +499,27 @@ class DocumentSymbolParser:
 
     @staticmethod
     def parse_selection_range(value: dict[str, JsonValue]) -> lsp_types.Range:
-        line = DiagnosticParser.as_int(
+        line = JsonOutput.int(
             value.get("selection_line", value.get("line", 0)),
             field="selection_line",
         )
-        character = DiagnosticParser.as_int(
+        character = JsonOutput.int(
             value.get("selection_character", value.get("character", 0)),
             field="selection_character",
         )
-        end_line = DiagnosticParser.as_int(
+        end_line = JsonOutput.int(
             value.get("selection_end_line", line),
             field="selection_end_line",
         )
-        end_character = DiagnosticParser.as_int(
+        end_character = JsonOutput.int(
             value.get("selection_end_character", max(character + 1, 1)),
             field="selection_end_character",
         )
-        return lsp_types.Range(
-            start=lsp_types.Position(line=line, character=character),
-            end=lsp_types.Position(line=end_line, character=end_character),
+        return LspRanges.create(
+            line=line,
+            character=character,
+            end_line=end_line,
+            end_character=end_character,
         )
 
     @staticmethod
@@ -1084,6 +1144,52 @@ class ServerConfig:
 
         return server
 
+    def run_document_command(
+        self,
+        ls: LanguageServer,
+        *,
+        command: Command,
+        uri: str,
+        title: str,
+        allow_failure_with_stdout: bool = False,
+        line: int | None = None,
+        character: int | None = None,
+    ) -> CommandRun | None:
+        document = CommandDocument.from_server(ls, uri)
+        try:
+            result = command.run(
+                source=document.source,
+                file_path=document.path,
+                uri=document.uri,
+                line=line,
+                character=character,
+            )
+            if result.returncode != 0 and (
+                not allow_failure_with_stdout or not result.stdout.strip()
+            ):
+                raise subprocess.CalledProcessError(
+                    result.returncode,
+                    result.argv,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            self.log_command_error(
+                ls,
+                title=title,
+                command=command,
+                file_path=document.path,
+                error=error,
+            )
+            return None
+        return CommandRun(document=document, result=result)
+
     def register_formatting(self, server: LanguageServer, command: Command) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_FORMATTING)
         def formatting(  # pyright: ignore[reportUnusedFunction]
@@ -1091,40 +1197,19 @@ class ServerConfig:
             params: lsp_types.DocumentFormattingParams,
         ) -> list[lsp_types.TextEdit]:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_FORMATTING, params)
-            doc = ls.workspace.get_text_document(params.text_document.uri)
-            try:
-                result = command.run(
-                    source=doc.source,
-                    file_path=doc.path,
-                    uri=doc.uri,
-                )
-                if result.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        result.returncode,
-                        result.argv,
-                        output=result.stdout,
-                        stderr=result.stderr,
-                    )
-            except (
-                OSError,
-                subprocess.SubprocessError,
-                KeyError,
-                IndexError,
-                ValueError,
-            ) as error:
-                self.log_command_error(
-                    ls,
-                    title="formatter error",
-                    command=command,
-                    file_path=doc.path,
-                    error=error,
-                )
+            run = self.run_document_command(
+                ls,
+                command=command,
+                uri=params.text_document.uri,
+                title="formatter error",
+            )
+            if run is None:
                 return []
 
             return [
                 lsp_types.TextEdit(
-                    range=TextRanges.full_document(doc.source),
-                    new_text=result.stdout,
+                    range=TextRanges.full_document(run.document.source),
+                    new_text=run.result.stdout,
                 ),
             ]
 
@@ -1168,19 +1253,19 @@ class ServerConfig:
             params: lsp_types.CodeActionParams,
         ) -> list[lsp_types.CodeAction]:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_CODE_ACTION, params)
-            doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
-                result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
-                if result.returncode != 0 and not result.stdout.strip():
-                    raise subprocess.CalledProcessError(
-                        result.returncode,
-                        result.argv,
-                        output=result.stdout,
-                        stderr=result.stderr,
-                    )
+                run = self.run_document_command(
+                    ls,
+                    command=command,
+                    uri=params.text_document.uri,
+                    title="code actions error",
+                    allow_failure_with_stdout=True,
+                )
+                if run is None:
+                    return []
                 actions = ShellCheckJsonParser.parse_code_actions(
-                    result.stdout,
-                    file_uri=doc.uri,
+                    run.result.stdout,
+                    file_uri=run.document.uri,
                 )
                 return CodeActionFilter.apply(
                     actions,
@@ -1188,8 +1273,6 @@ class ServerConfig:
                     context_diagnostics=params.context.diagnostics,
                 )
             except (
-                OSError,
-                subprocess.SubprocessError,
                 json.JSONDecodeError,
                 TypeError,
                 ValueError,
@@ -1198,7 +1281,7 @@ class ServerConfig:
                     ls,
                     title="code actions error",
                     command=command,
-                    file_path=doc.path,
+                    file_path=params.text_document.uri,
                     error=error,
                 )
                 return []
@@ -1210,26 +1293,19 @@ class ServerConfig:
             params: lsp_types.HoverParams,
         ) -> lsp_types.Hover | None:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_HOVER, params)
-            doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
-                result = command.run(
-                    source=doc.source,
-                    file_path=doc.path,
-                    uri=doc.uri,
+                run = self.run_document_command(
+                    ls,
+                    command=command,
+                    uri=params.text_document.uri,
+                    title="hover error",
                     line=params.position.line,
                     character=params.position.character,
                 )
-                if result.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        result.returncode,
-                        result.argv,
-                        output=result.stdout,
-                        stderr=result.stderr,
-                    )
-                return HoverParser.parse_stdout(result.stdout)
+                if run is None:
+                    return None
+                return HoverParser.parse_stdout(run.result.stdout)
             except (
-                OSError,
-                subprocess.SubprocessError,
                 json.JSONDecodeError,
                 TypeError,
                 ValueError,
@@ -1238,7 +1314,7 @@ class ServerConfig:
                     ls,
                     title="hover error",
                     command=command,
-                    file_path=doc.path,
+                    file_path=params.text_document.uri,
                     error=error,
                 )
                 return None
@@ -1287,20 +1363,17 @@ class ServerConfig:
             params: lsp_types.DocumentSymbolParams,
         ) -> list[lsp_types.DocumentSymbol]:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DOCUMENT_SYMBOL, params)
-            doc = ls.workspace.get_text_document(params.text_document.uri)
             try:
-                result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
-                if result.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        result.returncode,
-                        result.argv,
-                        output=result.stdout,
-                        stderr=result.stderr,
-                    )
-                return DocumentSymbolParser.parse_stdout(result.stdout)
+                run = self.run_document_command(
+                    ls,
+                    command=command,
+                    uri=params.text_document.uri,
+                    title="document symbols error",
+                )
+                if run is None:
+                    return []
+                return DocumentSymbolParser.parse_stdout(run.result.stdout)
             except (
-                OSError,
-                subprocess.SubprocessError,
                 json.JSONDecodeError,
                 TypeError,
                 ValueError,
@@ -1309,7 +1382,7 @@ class ServerConfig:
                     ls,
                     title="document symbols error",
                     command=command,
-                    file_path=doc.path,
+                    file_path=params.text_document.uri,
                     error=error,
                 )
                 return []
@@ -1324,26 +1397,19 @@ class ServerConfig:
         character: int,
         title: str,
     ) -> lsp_types.Location | list[lsp_types.Location] | None:
-        doc = ls.workspace.get_text_document(uri)
         try:
-            result = command.run(
-                source=doc.source,
-                file_path=doc.path,
-                uri=doc.uri,
+            run = self.run_document_command(
+                ls,
+                command=command,
+                uri=uri,
+                title=title,
                 line=line,
                 character=character,
             )
-            if result.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    result.returncode,
-                    result.argv,
-                    output=result.stdout,
-                    stderr=result.stderr,
-                )
-            return LocationParser.parse_stdout(result.stdout)
+            if run is None:
+                return None
+            return LocationParser.parse_stdout(run.result.stdout)
         except (
-            OSError,
-            subprocess.SubprocessError,
             json.JSONDecodeError,
             TypeError,
             ValueError,
@@ -1352,7 +1418,7 @@ class ServerConfig:
                 ls,
                 title=title,
                 command=command,
-                file_path=doc.path,
+                file_path=uri,
                 error=error,
             )
             return None
@@ -1364,13 +1430,18 @@ class ServerConfig:
         *,
         command: Command,
     ) -> None:
-        doc = ls.workspace.get_text_document(uri)
         try:
-            result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
-            diagnostics = DiagnosticParser.parse_stdout(result.stdout)
+            run = self.run_document_command(
+                ls,
+                command=command,
+                uri=uri,
+                title="diagnostics command failed",
+                allow_failure_with_stdout=True,
+            )
+            if run is None:
+                return
+            diagnostics = DiagnosticParser.parse_stdout(run.result.stdout)
         except (
-            OSError,
-            subprocess.SubprocessError,
             json.JSONDecodeError,
             TypeError,
             ValueError,
@@ -1379,23 +1450,8 @@ class ServerConfig:
                 ls,
                 title="diagnostics error",
                 command=command,
-                file_path=doc.path,
+                file_path=uri,
                 error=error,
-            )
-            return
-
-        if result.returncode != 0 and not diagnostics:
-            self.log_command_error(
-                ls,
-                title="diagnostics command failed",
-                command=command,
-                file_path=doc.path,
-                error=subprocess.CalledProcessError(
-                    result.returncode,
-                    result.argv,
-                    output=result.stdout,
-                    stderr=result.stderr,
-                ),
             )
             return
 
