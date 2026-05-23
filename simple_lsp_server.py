@@ -21,6 +21,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from string import Formatter
 from typing import ClassVar, Literal, TypeAlias, cast
 
 import lsprotocol.types as lsp_types
@@ -44,6 +45,17 @@ class CommandResult:
 @dataclass(frozen=True, kw_only=True)
 class Command:
     argv: tuple[str, ...]
+    DEFAULT_TIMEOUT_SECONDS: ClassVar[float] = 10.0
+    PLACEHOLDERS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "file_path",
+            "uri",
+            "line",
+            "character",
+            "line1",
+            "character1",
+        },
+    )
 
     @classmethod
     def from_string(cls, value: str) -> Self:
@@ -79,7 +91,41 @@ class Command:
             "line1": "" if line is None else str(line + 1),
             "character1": "" if character is None else str(character + 1),
         }
-        return [part.format(**values) for part in self.argv]
+        return [self.render_part(part, values=values) for part in self.argv]
+
+    @classmethod
+    def render_part(cls, part: str, *, values: dict[str, str]) -> str:
+        """Render known placeholders without treating other braces as format syntax.
+
+        >>> Command.render_part("awk {print}", values={"file_path": "a.py"})
+        'awk {print}'
+        >>> Command.render_part("{file_path}:{line1}", values={"file_path": "a.py", "line1": "3"})
+        'a.py:3'
+        """
+        rendered_parts: list[str] = []
+        try:
+            parsed = list(Formatter().parse(part))
+        except ValueError:
+            return part
+        for literal, field_name, format_spec, conversion in parsed:
+            rendered_parts.append(literal)
+            if field_name is None:
+                continue
+            placeholder = "{" + field_name
+            if conversion is not None:
+                placeholder += f"!{conversion}"
+            if format_spec:
+                placeholder += f":{format_spec}"
+            placeholder += "}"
+            if (
+                field_name in cls.PLACEHOLDERS
+                and not format_spec
+                and conversion is None
+            ):
+                rendered_parts.append(values.get(field_name, ""))
+            else:
+                rendered_parts.append(placeholder)
+        return "".join(rendered_parts)
 
     def run(
         self,
@@ -89,6 +135,7 @@ class Command:
         uri: str,
         line: int | None = None,
         character: int | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> CommandResult:
         argv = self.render(
             file_path=file_path,
@@ -101,6 +148,7 @@ class Command:
             input=source,
             capture_output=True,
             text=True,
+            timeout=timeout_seconds,
         )
         return CommandResult(
             argv=argv,
@@ -124,6 +172,35 @@ class TextRanges:
         return lsp_types.Range(
             start=lsp_types.Position(line=0, character=0),
             end=lsp_types.Position(line=len(lines) - 1, character=len(lines[-1])),
+        )
+
+
+class LspRanges:
+    @staticmethod
+    def overlaps(left: lsp_types.Range, right: lsp_types.Range) -> bool:
+        """Return whether two LSP ranges overlap or touch.
+
+        >>> a = lsp_types.Range(start=lsp_types.Position(line=0, character=1), end=lsp_types.Position(line=0, character=3))
+        >>> b = lsp_types.Range(start=lsp_types.Position(line=0, character=2), end=lsp_types.Position(line=0, character=4))
+        >>> LspRanges.overlaps(a, b)
+        True
+        """
+        return not (
+            LspRanges.is_before(left.end, right.start)
+            or LspRanges.is_before(right.end, left.start)
+        )
+
+    @staticmethod
+    def is_before(left: lsp_types.Position, right: lsp_types.Position) -> bool:
+        return (left.line, left.character) < (right.line, right.character)
+
+    @staticmethod
+    def same(left: lsp_types.Range, right: lsp_types.Range) -> bool:
+        return (
+            left.start.line == right.start.line
+            and left.start.character == right.start.character
+            and left.end.line == right.end.line
+            and left.end.character == right.end.character
         )
 
 
@@ -151,6 +228,55 @@ class JsonOutput:
 class DiagnosticAndCodeAction:
     diagnostic: lsp_types.Diagnostic
     code_action: lsp_types.CodeAction | None
+
+
+class CodeActionFilter:
+    @classmethod
+    def apply(
+        cls,
+        actions: list[lsp_types.CodeAction],
+        *,
+        request_range: lsp_types.Range,
+        context_diagnostics: list[lsp_types.Diagnostic],
+    ) -> list[lsp_types.CodeAction]:
+        if context_diagnostics:
+            return [
+                action
+                for action in actions
+                if cls.matches_any_context_diagnostic(action, context_diagnostics)
+            ]
+        return [
+            action
+            for action in actions
+            if any(
+                LspRanges.overlaps(diagnostic.range, request_range)
+                for diagnostic in action.diagnostics or []
+            )
+        ]
+
+    @classmethod
+    def matches_any_context_diagnostic(
+        cls,
+        action: lsp_types.CodeAction,
+        context_diagnostics: list[lsp_types.Diagnostic],
+    ) -> bool:
+        return any(
+            cls.same_diagnostic(action_diagnostic, context_diagnostic)
+            for action_diagnostic in action.diagnostics or []
+            for context_diagnostic in context_diagnostics
+        )
+
+    @staticmethod
+    def same_diagnostic(
+        left: lsp_types.Diagnostic,
+        right: lsp_types.Diagnostic,
+    ) -> bool:
+        return (
+            LspRanges.same(left.range, right.range)
+            and left.message == right.message
+            and left.code == right.code
+            and left.source == right.source
+        )
 
 
 class LocationParser:
@@ -936,31 +1062,29 @@ class ServerConfig:
         server = LanguageServer("simple-command-lsp", "0.1")
 
         if self.format_command is not None:
-            self.register_formatting(server)
+            self.register_formatting(server, self.format_command)
 
         if self.diagnostics_command is not None:
-            self.register_diagnostics(server)
+            self.register_diagnostics(server, self.diagnostics_command)
 
         if self.code_actions_command is not None:
-            self.register_code_actions(server)
+            self.register_code_actions(server, self.code_actions_command)
 
         if self.hover_command is not None:
-            self.register_hover(server)
+            self.register_hover(server, self.hover_command)
 
         if self.definition_command is not None:
-            self.register_definition(server)
+            self.register_definition(server, self.definition_command)
 
         if self.references_command is not None:
-            self.register_references(server)
+            self.register_references(server, self.references_command)
 
         if self.document_symbols_command is not None:
-            self.register_document_symbols(server)
+            self.register_document_symbols(server, self.document_symbols_command)
 
         return server
 
-    def register_formatting(self, server: LanguageServer) -> None:
-        command = self.require_format_command()
-
+    def register_formatting(self, server: LanguageServer, command: Command) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_FORMATTING)
         def formatting(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
@@ -1004,14 +1128,14 @@ class ServerConfig:
                 ),
             ]
 
-    def register_diagnostics(self, server: LanguageServer) -> None:
+    def register_diagnostics(self, server: LanguageServer, command: Command) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_DID_OPEN)
         def did_open(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
             params: lsp_types.DidOpenTextDocumentParams,
         ) -> None:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DID_OPEN, params)
-            self.publish_diagnostics(ls, params.text_document.uri)
+            self.publish_diagnostics(ls, params.text_document.uri, command=command)
 
         @server.feature(lsp_types.TEXT_DOCUMENT_DID_SAVE)
         def did_save(  # pyright: ignore[reportUnusedFunction]
@@ -1019,7 +1143,7 @@ class ServerConfig:
             params: lsp_types.DidSaveTextDocumentParams,
         ) -> None:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DID_SAVE, params)
-            self.publish_diagnostics(ls, params.text_document.uri)
+            self.publish_diagnostics(ls, params.text_document.uri, command=command)
 
         if not self.diagnostics_on_change:
             return
@@ -1030,11 +1154,9 @@ class ServerConfig:
             params: lsp_types.DidChangeTextDocumentParams,
         ) -> None:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_DID_CHANGE, params)
-            self.publish_diagnostics(ls, params.text_document.uri)
+            self.publish_diagnostics(ls, params.text_document.uri, command=command)
 
-    def register_code_actions(self, server: LanguageServer) -> None:
-        command = self.require_code_actions_command()
-
+    def register_code_actions(self, server: LanguageServer, command: Command) -> None:
         @server.feature(
             lsp_types.TEXT_DOCUMENT_CODE_ACTION,
             lsp_types.CodeActionOptions(
@@ -1056,9 +1178,14 @@ class ServerConfig:
                         output=result.stdout,
                         stderr=result.stderr,
                     )
-                return ShellCheckJsonParser.parse_code_actions(
+                actions = ShellCheckJsonParser.parse_code_actions(
                     result.stdout,
                     file_uri=doc.uri,
+                )
+                return CodeActionFilter.apply(
+                    actions,
+                    request_range=params.range,
+                    context_diagnostics=params.context.diagnostics,
                 )
             except (
                 OSError,
@@ -1076,9 +1203,7 @@ class ServerConfig:
                 )
                 return []
 
-    def register_hover(self, server: LanguageServer) -> None:
-        command = self.require_hover_command()
-
+    def register_hover(self, server: LanguageServer, command: Command) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_HOVER)
         def hover(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
@@ -1118,9 +1243,7 @@ class ServerConfig:
                 )
                 return None
 
-    def register_definition(self, server: LanguageServer) -> None:
-        command = self.require_definition_command()
-
+    def register_definition(self, server: LanguageServer, command: Command) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_DEFINITION)
         def definition(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
@@ -1136,9 +1259,7 @@ class ServerConfig:
                 title="definition error",
             )
 
-    def register_references(self, server: LanguageServer) -> None:
-        command = self.require_references_command()
-
+    def register_references(self, server: LanguageServer, command: Command) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_REFERENCES)
         def references(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
@@ -1157,9 +1278,9 @@ class ServerConfig:
                 return [locations]
             return locations
 
-    def register_document_symbols(self, server: LanguageServer) -> None:
-        command = self.require_document_symbols_command()
-
+    def register_document_symbols(
+        self, server: LanguageServer, command: Command
+    ) -> None:
         @server.feature(lsp_types.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
         def document_symbols(  # pyright: ignore[reportUnusedFunction]
             ls: LanguageServer,
@@ -1236,13 +1357,24 @@ class ServerConfig:
             )
             return None
 
-    def publish_diagnostics(self, ls: LanguageServer, uri: str) -> None:
-        command = self.require_diagnostics_command()
+    def publish_diagnostics(
+        self,
+        ls: LanguageServer,
+        uri: str,
+        *,
+        command: Command,
+    ) -> None:
         doc = ls.workspace.get_text_document(uri)
         try:
             result = command.run(source=doc.source, file_path=doc.path, uri=doc.uri)
             diagnostics = DiagnosticParser.parse_stdout(result.stdout)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
             self.log_command_error(
                 ls,
                 title="diagnostics error",
@@ -1268,48 +1400,6 @@ class ServerConfig:
             return
 
         ls.publish_diagnostics(uri, diagnostics)  # pyright: ignore[reportUnknownMemberType]
-
-    def require_format_command(self) -> Command:
-        if self.format_command is None:
-            msg = "format command is not configured"
-            raise ValueError(msg)
-        return self.format_command
-
-    def require_diagnostics_command(self) -> Command:
-        if self.diagnostics_command is None:
-            msg = "diagnostics command is not configured"
-            raise ValueError(msg)
-        return self.diagnostics_command
-
-    def require_code_actions_command(self) -> Command:
-        if self.code_actions_command is None:
-            msg = "code actions command is not configured"
-            raise ValueError(msg)
-        return self.code_actions_command
-
-    def require_hover_command(self) -> Command:
-        if self.hover_command is None:
-            msg = "hover command is not configured"
-            raise ValueError(msg)
-        return self.hover_command
-
-    def require_definition_command(self) -> Command:
-        if self.definition_command is None:
-            msg = "definition command is not configured"
-            raise ValueError(msg)
-        return self.definition_command
-
-    def require_references_command(self) -> Command:
-        if self.references_command is None:
-            msg = "references command is not configured"
-            raise ValueError(msg)
-        return self.references_command
-
-    def require_document_symbols_command(self) -> Command:
-        if self.document_symbols_command is None:
-            msg = "document symbols command is not configured"
-            raise ValueError(msg)
-        return self.document_symbols_command
 
     @staticmethod
     def log_command_error(

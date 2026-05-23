@@ -11,10 +11,11 @@ The server exposes external commands through practical LSP features:
 - document symbols
 
 Commands are passed as shell-style strings, parsed with `shlex.split`, and then
-executed without a shell. Commands receive the document text on stdin. All
-commands support `{file_path}` and `{uri}` placeholders. Position-aware commands
-also support zero-based `{line}` and `{character}` plus one-based `{line1}` and
-`{character1}`.
+executed without a shell. Commands receive the document text on stdin and time
+out after 10 seconds. All commands support `{file_path}` and `{uri}`
+placeholders. Position-aware commands also support zero-based `{line}` and
+`{character}` plus one-based `{line1}` and `{character1}`. Other braces are left
+unchanged.
 
 Examples:
 
