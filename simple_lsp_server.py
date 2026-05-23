@@ -21,19 +21,14 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from string import Formatter
-from typing import ClassVar, Literal, TypeAlias, cast
+from typing import ClassVar, TypeAlias, cast
 
 import lsprotocol.types as lsp_types
 from pygls.server import LanguageServer
-from typing_extensions import Self, assert_never
+from typing_extensions import Self
 
-SeverityName = Literal["error", "warning", "information", "hint"]
 JsonValue: TypeAlias = (
     None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-)
-CommandException: TypeAlias = (
-    OSError | subprocess.SubprocessError | json.JSONDecodeError | TypeError | ValueError
 )
 
 
@@ -77,6 +72,9 @@ class Command:
             "character1",
         },
     )
+    PLACEHOLDER_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"\{(file_path|uri|line|character|line1|character1)\}",
+    )
 
     @classmethod
     def from_string(cls, value: str) -> Self:
@@ -85,7 +83,11 @@ class Command:
         >>> Command.from_string("ruff format --stdin-filename {file_path} -")
         Command(argv=('ruff', 'format', '--stdin-filename', '{file_path}', '-'))
         """
-        return cls(argv=tuple(shlex.split(value)))
+        argv = tuple(shlex.split(value))
+        if not argv:
+            msg = "command must not be empty"
+            raise ValueError(msg)
+        return cls(argv=argv)
 
     def render(
         self,
@@ -122,31 +124,15 @@ class Command:
         'awk {print}'
         >>> Command.render_part("{file_path}:{line1}", values={"file_path": "a.py", "line1": "3"})
         'a.py:3'
+        >>> Command.render_part("{file_path}:{line1}", values={"file_path": "{line1}.py", "line1": "3"})
+        '{line1}.py:3'
+        >>> Command.render_part("{file_path} {", values={"file_path": "a.py"})
+        'a.py {'
         """
-        rendered_parts: list[str] = []
-        try:
-            parsed = list(Formatter().parse(part))
-        except ValueError:
-            return part
-        for literal, field_name, format_spec, conversion in parsed:
-            rendered_parts.append(literal)
-            if field_name is None:
-                continue
-            placeholder = "{" + field_name
-            if conversion is not None:
-                placeholder += f"!{conversion}"
-            if format_spec:
-                placeholder += f":{format_spec}"
-            placeholder += "}"
-            if (
-                field_name in cls.PLACEHOLDERS
-                and not format_spec
-                and conversion is None
-            ):
-                rendered_parts.append(values.get(field_name, ""))
-            else:
-                rendered_parts.append(placeholder)
-        return "".join(rendered_parts)
+        return cls.PLACEHOLDER_PATTERN.sub(
+            lambda match: values.get(match.group(1), ""),
+            part,
+        )
 
     def run(
         self,
@@ -158,6 +144,9 @@ class Command:
         character: int | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> CommandResult:
+        if not self.argv:
+            msg = "command must not be empty"
+            raise ValueError(msg)
         argv = self.render(
             file_path=file_path,
             uri=uri,
@@ -192,11 +181,25 @@ class TextRanges:
         lines = source.split("\n")
         return lsp_types.Range(
             start=lsp_types.Position(line=0, character=0),
-            end=lsp_types.Position(line=len(lines) - 1, character=len(lines[-1])),
+            end=lsp_types.Position(
+                line=len(lines) - 1,
+                character=LspRanges.utf16_length(lines[-1]),
+            ),
         )
 
 
 class LspRanges:
+    @staticmethod
+    def utf16_length(value: str) -> int:
+        """Return the LSP character length for a string.
+
+        >>> LspRanges.utf16_length("a")
+        1
+        >>> LspRanges.utf16_length("😀")
+        2
+        """
+        return len(value.encode("utf-16-le")) // 2
+
     @staticmethod
     def create(
         *,
@@ -209,6 +212,9 @@ class LspRanges:
             end_line = line
         if end_character is None:
             end_character = max(character + 1, 1)
+        if (end_line, end_character) < (line, character):
+            msg = "range end must not be before range start"
+            raise ValueError(msg)
         return lsp_types.Range(
             start=lsp_types.Position(line=line, character=character),
             end=lsp_types.Position(line=end_line, character=end_character),
@@ -265,7 +271,7 @@ class JsonOutput:
     def int(value: object, *, field: str) -> int:
         if isinstance(value, str):
             value = int(value)
-        if not isinstance(value, int):
+        if isinstance(value, bool) or not isinstance(value, int):
             msg = f"{field} must be an integer"
             raise TypeError(msg)
         if value < 0:
@@ -524,6 +530,9 @@ class DocumentSymbolParser:
 
     @staticmethod
     def parse_kind(value: JsonValue) -> lsp_types.SymbolKind:
+        if isinstance(value, bool):
+            msg = "symbol kind must be a string or integer"
+            raise TypeError(msg)
         if isinstance(value, int):
             return lsp_types.SymbolKind(value)
         if not isinstance(value, str):
@@ -663,9 +672,11 @@ class ShellCheckJsonParser:
             raise TypeError(msg)
         code = DiagnosticParser.as_int(value.get("code"), field="code")
         return lsp_types.Diagnostic(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=character),
-                end=lsp_types.Position(line=end_line, character=end_character),
+            range=LspRanges.create(
+                line=line,
+                character=character,
+                end_line=end_line,
+                end_character=end_character,
             ),
             message=message,
             severity=cls.parse_severity(value.get("level")),
@@ -750,9 +761,11 @@ class ShellCheckJsonParser:
             msg = "shellcheck replacement text must be a string"
             raise TypeError(msg)
         return lsp_types.TextEdit(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=character),
-                end=lsp_types.Position(line=end_line, character=end_character),
+            range=LspRanges.create(
+                line=line,
+                character=character,
+                end_line=end_line,
+                end_character=end_character,
             ),
             new_text=replacement_text,
         )
@@ -876,9 +889,11 @@ class DiagnosticParser:
 
         severity = cls.parse_severity(item.get("severity", "error"))
         return lsp_types.Diagnostic(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=character),
-                end=lsp_types.Position(line=end_line, character=end_character),
+            range=LspRanges.create(
+                line=line,
+                character=character,
+                end_line=end_line,
+                end_character=end_character,
             ),
             message=message,
             severity=severity,
@@ -922,9 +937,11 @@ class DiagnosticParser:
             raise TypeError(msg)
 
         return lsp_types.Diagnostic(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=character),
-                end=lsp_types.Position(line=end_line, character=end_character),
+            range=LspRanges.create(
+                line=line,
+                character=character,
+                end_line=end_line,
+                end_character=end_character,
             ),
             message=message,
             severity=cls.parse_severity(item.get("severity", "error")),
@@ -954,10 +971,7 @@ class DiagnosticParser:
             raise TypeError(msg)
 
         return lsp_types.Diagnostic(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=0),
-                end=lsp_types.Position(line=line, character=1),
-            ),
+            range=LspRanges.create(line=line, character=0),
             message=description,
             severity=lsp_types.DiagnosticSeverity.Warning,
             source=filename,
@@ -998,10 +1012,7 @@ class DiagnosticParser:
             message = message[: code_match.start()].rstrip()
 
         return lsp_types.Diagnostic(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=character),
-                end=lsp_types.Position(line=line, character=character + 1),
-            ),
+            range=LspRanges.create(line=line, character=character),
             message=message,
             severity=cls.parse_gcc_severity(match.group("severity")),
             source=match.group("path"),
@@ -1024,10 +1035,7 @@ class DiagnosticParser:
         code = match.group("code").split("/", maxsplit=1)[0]
 
         return lsp_types.Diagnostic(
-            range=lsp_types.Range(
-                start=lsp_types.Position(line=line, character=character),
-                end=lsp_types.Position(line=line, character=character + 1),
-            ),
+            range=LspRanges.create(line=line, character=character),
             message=match.group("message"),
             severity=lsp_types.DiagnosticSeverity.Warning,
             source=match.group("path"),
@@ -1036,22 +1044,11 @@ class DiagnosticParser:
 
     @staticmethod
     def as_int(value: object, *, field: str) -> int:
-        if isinstance(value, str):
-            value = int(value)
-        if not isinstance(value, int):
-            msg = f"diagnostic {field} must be an integer"
-            raise TypeError(msg)
-        if value < 0:
-            msg = f"diagnostic {field} must be non-negative"
-            raise ValueError(msg)
-        return value
+        return JsonOutput.int(value, field=f"diagnostic {field}")
 
     @staticmethod
     def one_based_to_zero_based(value: int, *, field: str) -> int:
-        if value == 0:
-            msg = f"diagnostic {field} must be one-based"
-            raise ValueError(msg)
-        return value - 1
+        return JsonOutput.one_based_int(value, field=f"diagnostic {field}")
 
     @classmethod
     def parse_gcc_severity(cls, value: str | None) -> lsp_types.DiagnosticSeverity:
@@ -1071,25 +1068,32 @@ class DiagnosticParser:
         <DiagnosticSeverity.Error: 1>
         >>> DiagnosticParser.parse_severity(2)
         <DiagnosticSeverity.Warning: 2>
+        >>> DiagnosticParser.parse_severity("info")
+        <DiagnosticSeverity.Information: 3>
         """
+        if isinstance(value, bool):
+            msg = "diagnostic severity must be a string or integer"
+            raise TypeError(msg)
         if isinstance(value, int):
             return lsp_types.DiagnosticSeverity(value)
         if not isinstance(value, str):
             msg = "diagnostic severity must be a string or integer"
             raise TypeError(msg)
 
-        severity = cast(SeverityName, value.lower())
-        match severity:
-            case "error":
-                return lsp_types.DiagnosticSeverity.Error
-            case "warning":
-                return lsp_types.DiagnosticSeverity.Warning
-            case "information":
-                return lsp_types.DiagnosticSeverity.Information
-            case "hint":
-                return lsp_types.DiagnosticSeverity.Hint
-            case _:
-                assert_never(severity)
+        severities = {
+            "error": lsp_types.DiagnosticSeverity.Error,
+            "warning": lsp_types.DiagnosticSeverity.Warning,
+            "information": lsp_types.DiagnosticSeverity.Information,
+            "info": lsp_types.DiagnosticSeverity.Information,
+            "note": lsp_types.DiagnosticSeverity.Information,
+            "hint": lsp_types.DiagnosticSeverity.Hint,
+            "style": lsp_types.DiagnosticSeverity.Hint,
+        }
+        try:
+            return severities[value.lower()]
+        except KeyError as error:
+            msg = f"unsupported diagnostic severity: {value}"
+            raise ValueError(msg) from error
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1155,8 +1159,9 @@ class ServerConfig:
         line: int | None = None,
         character: int | None = None,
     ) -> CommandRun | None:
-        document = CommandDocument.from_server(ls, uri)
+        document: CommandDocument | None = None
         try:
+            document = CommandDocument.from_server(ls, uri)
             result = command.run(
                 source=document.source,
                 file_path=document.path,
@@ -1174,9 +1179,9 @@ class ServerConfig:
                     stderr=result.stderr,
                 )
         except (
+            KeyError,
             OSError,
             subprocess.SubprocessError,
-            json.JSONDecodeError,
             TypeError,
             ValueError,
         ) as error:
@@ -1184,7 +1189,7 @@ class ServerConfig:
                 ls,
                 title=title,
                 command=command,
-                file_path=document.path,
+                file_path=uri if document is None else document.path,
                 error=error,
             )
             return None
