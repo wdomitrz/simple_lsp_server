@@ -31,3 +31,6 @@ extend-select = ["I"]
 pythonVersion = "3.10"
 typeCheckingMode = "all"
 exclude = []
+extraPaths = [
+    "/usr/lib/python3/dist-packages",
+]
