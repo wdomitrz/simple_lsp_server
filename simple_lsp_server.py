@@ -270,7 +270,11 @@ class JsonOutput:
     @staticmethod
     def int(value: object, *, field: str) -> int:
         if isinstance(value, str):
-            value = int(value)
+            try:
+                value = int(value)
+            except ValueError as error:
+                msg = f"{field} must be an integer"
+                raise ValueError(msg) from error
         if isinstance(value, bool) or not isinstance(value, int):
             msg = f"{field} must be an integer"
             raise TypeError(msg)
@@ -295,6 +299,21 @@ class DiagnosticAndCodeAction:
 
 
 class CodeActionFilter:
+    @staticmethod
+    def allows_quick_fix(only: list[lsp_types.CodeActionKind | str] | None) -> bool:
+        """Return whether a codeAction request permits quick fixes.
+
+        >>> CodeActionFilter.allows_quick_fix(None)
+        True
+        >>> CodeActionFilter.allows_quick_fix([lsp_types.CodeActionKind.QuickFix])
+        True
+        >>> CodeActionFilter.allows_quick_fix(["source"])
+        False
+        """
+        if only is None:
+            return True
+        return any(kind == lsp_types.CodeActionKind.QuickFix for kind in only)
+
     @classmethod
     def apply(
         cls,
@@ -594,12 +613,17 @@ class ShellCheckJsonParser:
         >>> [(d.range.start.line, d.range.start.character, d.code, d.severity) for d in diagnostics]
         [(0, 5, 2154, <DiagnosticSeverity.Warning: 2>)]
         """
+        if not stdout.strip():
+            return []
+        raw = JsonOutput.object(JsonOutput.loads(stdout), context="shellcheck output")
+        comments = JsonOutput.list(
+            raw.get("comments", []), context="shellcheck comments"
+        )
         return [
-            item.diagnostic
-            for item in cls.parse_diagnostics_and_code_actions(
-                stdout,
-                file_uri="file:///unknown",
+            cls.parse_diagnostic(
+                JsonOutput.object(comment, context="shellcheck comment")
             )
+            for comment in comments
         ]
 
     @classmethod
@@ -883,7 +907,7 @@ class DiagnosticParser:
             raise TypeError(msg)
 
         code = item.get("code")
-        if not isinstance(code, str | int | None):
+        if isinstance(code, bool) or not isinstance(code, str | int | None):
             msg = "diagnostic code must be a string, integer, or null"
             raise TypeError(msg)
 
@@ -1258,6 +1282,8 @@ class ServerConfig:
             params: lsp_types.CodeActionParams,
         ) -> list[lsp_types.CodeAction]:
             logging.debug("%s %s", lsp_types.TEXT_DOCUMENT_CODE_ACTION, params)
+            if not CodeActionFilter.allows_quick_fix(params.context.only):
+                return []
             try:
                 run = self.run_document_command(
                     ls,
